@@ -43,5 +43,36 @@
             };
           });
         });
+
+      nixosModules.default = { config, lib, pkgs, ... }:
+        let
+          cfg = config.services.osk;
+          osk = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        in {
+          options.services.osk.enable = lib.mkEnableOption "on-screen AZERTY keyboard for tablet mode";
+
+          config = lib.mkIf cfg.enable {
+            environment.systemPackages = [ osk ];
+
+            home-manager.users.andrei = { ... }: {
+              systemd.user.services.osk = {
+                Unit = {
+                  Description = "On-screen AZERTY keyboard";
+                  After = [ "hyprland-session.target" ];
+                  PartOf = [ "hyprland-session.target" ];
+                };
+                Service = {
+                  Type = "simple";
+                  ExecStart = "${osk}/bin/osk --hidden";
+                  Restart = "on-failure";
+                  RestartSec = 3;
+                };
+                Install = {
+                  WantedBy = [ "hyprland-session.target" ];
+                };
+              };
+            };
+          };
+        };
     };
 }
