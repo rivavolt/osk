@@ -299,6 +299,10 @@ static SYM_LAYER: &[Row] = &[&*NUM_ROW, &*SYM_R0, &*SYM_R1, &*SYM_R2, &*SYM_R3];
 static LAYERS: &[LayoutLayer] = &[MAIN_LAYER, SHIFT_LAYER, SYM_LAYER];
 
 const DEFAULT_KB_HEIGHT: u32 = 260;
+// Auto-hide the keyboard this long after the last keypress, even while a text
+// field keeps input focus. Survives natural typing pauses; clears away once
+// typing is actually done. (Focus loss hides instantly via input-method Deactivate.)
+const IDLE_HIDE_MS: u128 = 5000;
 const TARGET_KEY_HEIGHT_MM: f32 = 9.0;
 const MIN_KEY_HEIGHT_MM: f32 = 7.0;
 const MAX_KEY_HEIGHT_MM: f32 = 11.0;
@@ -894,6 +898,8 @@ struct OskState {
 
     visible: bool,
     auto_show_enabled: bool,
+    // Time of the last keypress while visible; drives the idle auto-hide timer.
+    last_activity: Option<std::time::Instant>,
     current_layer: usize,
     shift_state: ModState,
     ctrl_state: ModState,
@@ -966,7 +972,11 @@ impl OskState {
             width: 0,
             height: DEFAULT_KB_HEIGHT,
             visible: false,
-            auto_show_enabled: false, // starts disabled; SIGUSR2 (tablet mode) enables it
+            // Auto-show is driven by the Wayland input-method protocol (a focused
+            // text field requesting input), not by laptop/tablet posture, so a
+            // touch user gets the keyboard regardless of how the lid is folded.
+            auto_show_enabled: true,
+            last_activity: None,
             current_layer: 0,
             shift_state: ModState::Off,
             ctrl_state: ModState::Off,
@@ -1243,6 +1253,8 @@ impl OskState {
             return;
         }
         self.visible = true;
+        // Give a freshly-shown keyboard a full idle window before auto-hide.
+        self.last_activity = Some(std::time::Instant::now());
         // Reset all modifier state to prevent stuck modifiers
         self.shift_state = ModState::Off;
         self.ctrl_state = ModState::Off;
@@ -1433,6 +1445,8 @@ impl OskState {
     }
 
     fn handle_key_press(&mut self, key_idx: usize, _qh: &QueueHandle<Self>) {
+        // Any keypress resets the idle auto-hide timer.
+        self.last_activity = Some(std::time::Instant::now());
         let kr = &self.key_rects[key_idx];
         let code = kr.code;
 
@@ -2053,26 +2067,20 @@ fn main() {
     state.setup_virtual_keyboard(&qh);
     state.setup_input_method(&qh);
 
-    // Detect tablet mode from evdev SW_TABLET_MODE switch
+    // Auto-show is always armed and driven by the input-method protocol; the
+    // SW_TABLET_MODE switch only governs the optional manual toggle button.
     let tablet_mode_fd = match open_tablet_mode_device() {
         Some((fd, initial_tablet)) => {
-            state.auto_show_enabled = initial_tablet;
             if initial_tablet {
                 state.show_toggle_button(&qh);
-                if !start_hidden {
-                    state.show(&qh);
-                }
             }
             Some(fd)
         }
-        None => {
-            eprintln!("osk: no tablet mode switch found, auto-show stays disabled");
-            if !start_hidden {
-                state.show(&qh);
-            }
-            None
-        }
+        None => None,
     };
+    if !start_hidden {
+        state.show(&qh);
+    }
 
     event_queue.roundtrip(&mut state).unwrap();
 
@@ -2105,15 +2113,30 @@ fn main() {
             eprintln!("osk: wayland flush error: {}", e);
         }
 
-        let poll_timeout = if let Some(down_time) = state.touch_down_time {
-            if !state.long_press_active {
+        // Long-press detection wakes us 400ms after touch-down.
+        let long_press_timeout = match state.touch_down_time {
+            Some(down_time) if !state.long_press_active => {
                 let elapsed = std::time::Instant::now().duration_since(down_time).as_millis() as i32;
-                (400 - elapsed).max(0)
-            } else {
-                -1
+                Some((400 - elapsed).max(0))
             }
-        } else {
-            -1
+            _ => None,
+        };
+
+        // Idle auto-hide wakes us when the no-keypress window elapses.
+        let idle_timeout = match (state.visible, state.auto_show_enabled, state.last_activity) {
+            (true, true, Some(last)) => {
+                let elapsed = std::time::Instant::now().duration_since(last).as_millis();
+                Some((IDLE_HIDE_MS.saturating_sub(elapsed)) as i32)
+            }
+            _ => None,
+        };
+
+        // Block forever unless a timer is pending; otherwise wake at the soonest.
+        let poll_timeout = match (long_press_timeout, idle_timeout) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => -1,
         };
 
         // Poll wayland fd, signal pipe, and optionally tablet mode evdev
@@ -2176,15 +2199,12 @@ fn main() {
                         break;
                     }
                     if ev.type_ == EV_SW && ev.code == SW_TABLET_MODE {
+                        // Posture only shows/hides the manual toggle button;
+                        // auto-show stays armed and input-method-driven either way.
                         if ev.value != 0 {
-                            // Entering tablet mode
-                            state.auto_show_enabled = true;
                             state.show_toggle_button(&qh);
                             eprintln!("osk: tablet mode on");
                         } else {
-                            // Leaving tablet mode
-                            state.auto_show_enabled = false;
-                            state.hide();
                             state.hide_toggle_button();
                             eprintln!("osk: tablet mode off");
                         }
@@ -2229,6 +2249,17 @@ fn main() {
         if state.pending_show {
             state.pending_show = false;
             state.show(&qh);
+        }
+
+        // Idle auto-hide: drop the keyboard after a no-keypress window even if a
+        // text field still holds input focus. (Checked after dispatch so a
+        // keypress from this iteration has already refreshed last_activity.)
+        if state.visible && state.auto_show_enabled {
+            if let Some(last) = state.last_activity {
+                if std::time::Instant::now().duration_since(last).as_millis() >= IDLE_HIDE_MS {
+                    state.hide();
+                }
+            }
         }
 
         // Redraw if needed
