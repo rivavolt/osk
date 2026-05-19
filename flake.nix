@@ -37,7 +37,7 @@
             '';
 
             meta = {
-              description = "AZERTY on-screen keyboard for Wayland with auto-show on text input focus";
+              description = "AZERTY on-screen keyboard for Wayland with a touch-summoned toggle button in tablet mode";
               platforms = pkgs.lib.platforms.linux;
               mainProgram = "osk";
             };
@@ -63,7 +63,7 @@
                 };
                 Service = {
                   Type = "simple";
-                  ExecStart = "${osk}/bin/osk --hidden";
+                  ExecStart = "${osk}/bin/osk";
                   Restart = "on-failure";
                   RestartSec = 3;
                 };

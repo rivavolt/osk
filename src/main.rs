@@ -299,10 +299,10 @@ static SYM_LAYER: &[Row] = &[&*NUM_ROW, &*SYM_R0, &*SYM_R1, &*SYM_R2, &*SYM_R3];
 static LAYERS: &[LayoutLayer] = &[MAIN_LAYER, SHIFT_LAYER, SYM_LAYER];
 
 const DEFAULT_KB_HEIGHT: u32 = 260;
-// Auto-hide the keyboard this long after the last keypress, even while a text
-// field keeps input focus. Survives natural typing pauses; clears away once
-// typing is actually done. (Focus loss hides instantly via input-method Deactivate.)
-const IDLE_HIDE_MS: u128 = 5000;
+// In tablet mode the toggle button is hidden until the touchscreen is touched,
+// then auto-hides this long after the last touch. The keyboard itself is never
+// timed out — it stays until the button is tapped again.
+const BUTTON_IDLE_HIDE_MS: u128 = 3000;
 const TARGET_KEY_HEIGHT_MM: f32 = 9.0;
 const MIN_KEY_HEIGHT_MM: f32 = 7.0;
 const MAX_KEY_HEIGHT_MM: f32 = 11.0;
@@ -897,9 +897,11 @@ struct OskState {
     height: u32,
 
     visible: bool,
-    auto_show_enabled: bool,
-    // Time of the last keypress while visible; drives the idle auto-hide timer.
-    last_activity: Option<std::time::Instant>,
+    // True while the SW_TABLET_MODE switch reports tablet posture; gates the
+    // touch-summoned toggle button (in laptop mode the physical keyboard suffices).
+    tablet_mode: bool,
+    // Time of the last touchscreen event; drives the toggle button's idle hide.
+    last_touch_activity: Option<std::time::Instant>,
     current_layer: usize,
     shift_state: ModState,
     ctrl_state: ModState,
@@ -972,11 +974,9 @@ impl OskState {
             width: 0,
             height: DEFAULT_KB_HEIGHT,
             visible: false,
-            // Auto-show is driven by the Wayland input-method protocol (a focused
-            // text field requesting input), not by laptop/tablet posture, so a
-            // touch user gets the keyboard regardless of how the lid is folded.
-            auto_show_enabled: true,
-            last_activity: None,
+            // Set from the SW_TABLET_MODE switch at startup.
+            tablet_mode: false,
+            last_touch_activity: None,
             current_layer: 0,
             shift_state: ModState::Off,
             ctrl_state: ModState::Off,
@@ -1253,8 +1253,6 @@ impl OskState {
             return;
         }
         self.visible = true;
-        // Give a freshly-shown keyboard a full idle window before auto-hide.
-        self.last_activity = Some(std::time::Instant::now());
         // Reset all modifier state to prevent stuck modifiers
         self.shift_state = ModState::Off;
         self.ctrl_state = ModState::Off;
@@ -1445,8 +1443,6 @@ impl OskState {
     }
 
     fn handle_key_press(&mut self, key_idx: usize, _qh: &QueueHandle<Self>) {
-        // Any keypress resets the idle auto-hide timer.
-        self.last_activity = Some(std::time::Instant::now());
         let kr = &self.key_rects[key_idx];
         let code = kr.code;
 
@@ -1921,26 +1917,15 @@ impl Dispatch<WlTouch, ()> for OskState {
 
 impl Dispatch<ZwpInputMethodV2, ()> for OskState {
     fn event(
-        state: &mut Self,
+        _: &mut Self,
         _: &ZwpInputMethodV2,
-        event: zwp_input_method_v2::Event,
+        _: zwp_input_method_v2::Event,
         _: &(),
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
     ) {
-        match event {
-            zwp_input_method_v2::Event::Activate => {
-                if state.auto_show_enabled {
-                    state.show(qh);
-                }
-            }
-            zwp_input_method_v2::Event::Deactivate => {
-                if state.auto_show_enabled {
-                    state.hide();
-                }
-            }
-            _ => {}
-        }
+        // The input-method object is bound only to commit synthesized text; text
+        // field focus changes deliberately do not show or hide the keyboard.
     }
 }
 
@@ -2049,9 +2034,68 @@ fn open_tablet_mode_device() -> Option<(i32, bool)> {
     None
 }
 
-fn main() {
-    let start_hidden = std::env::args().any(|a| a == "--hidden");
+const EV_KEY: u16 = 0x01;
+const EV_ABS: u16 = 0x03;
+// Linux input bitmap positions: ABS_MT_POSITION_X axis, INPUT_PROP_DIRECT prop.
+const ABS_MT_POSITION_X: u32 = 0x35;
+const INPUT_PROP_DIRECT: u32 = 0x01;
 
+/// Test bit `n` in a sysfs bitmap string — space-separated 64-bit hex words,
+/// least-significant word last (the kernel's bitmap-print order).
+fn cap_bit_set(caps: &str, bit: u32) -> bool {
+    let words: Vec<&str> = caps.split_whitespace().collect();
+    let word_from_end = (bit / 64) as usize;
+    if word_from_end >= words.len() {
+        return false;
+    }
+    let word = u64::from_str_radix(words[words.len() - 1 - word_from_end], 16).unwrap_or(0);
+    word & (1u64 << (bit % 64)) != 0
+}
+
+/// Find every /dev/input/eventN that is a touchscreen and open it read-only.
+/// A touchscreen is a direct-input device (INPUT_PROP_DIRECT) with multitouch
+/// axes (ABS_MT_POSITION_X) — which excludes the touchpad (an indirect pointer
+/// that also reports MT axes) and the stylus (direct, but no MT finger axes).
+/// Returns the open fds; any of them seeing input means a finger touched glass.
+fn open_touchscreen_devices() -> Vec<i32> {
+    let mut fds = Vec::new();
+    let input_dir = match std::fs::read_dir("/sys/class/input") {
+        Ok(d) => d,
+        Err(_) => return fds,
+    };
+    for entry in input_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("event") {
+            continue;
+        }
+        let sysfs = |f: &str| {
+            std::fs::read_to_string(format!("/sys/class/input/{}/device/{}", name_str, f))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        };
+        if !cap_bit_set(&sysfs("properties"), INPUT_PROP_DIRECT)
+            || !cap_bit_set(&sysfs("capabilities/abs"), ABS_MT_POSITION_X)
+        {
+            continue;
+        }
+        let dev_path = format!("/dev/input/{}", name_str);
+        let c_path = std::ffi::CString::new(dev_path.as_str()).unwrap();
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if fd < 0 {
+            eprintln!("osk: cannot open {} for touch detection: {}", dev_path, std::io::Error::last_os_error());
+            continue;
+        }
+        eprintln!("osk: touchscreen device {}", dev_path);
+        fds.push(fd);
+    }
+    if fds.is_empty() {
+        eprintln!("osk: no touchscreen found, the toggle button will not auto-appear");
+    }
+    fds
+}
+
+fn main() {
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland");
     let display = conn.display();
 
@@ -2067,20 +2111,20 @@ fn main() {
     state.setup_virtual_keyboard(&qh);
     state.setup_input_method(&qh);
 
-    // Auto-show is always armed and driven by the input-method protocol; the
-    // SW_TABLET_MODE switch only governs the optional manual toggle button.
+    // The SW_TABLET_MODE switch decides whether the touch-summoned toggle button
+    // is in play at all. The button itself stays hidden until the touchscreen is
+    // touched; it is never shown merely because we entered tablet mode.
     let tablet_mode_fd = match open_tablet_mode_device() {
         Some((fd, initial_tablet)) => {
-            if initial_tablet {
-                state.show_toggle_button(&qh);
-            }
+            state.tablet_mode = initial_tablet;
             Some(fd)
         }
         None => None,
     };
-    if !start_hidden {
-        state.show(&qh);
-    }
+
+    // Touchscreen fds: any input on them is "the user touched the screen", which
+    // is what reveals the toggle button while in tablet mode.
+    let touchscreen_fds = open_touchscreen_devices();
 
     event_queue.roundtrip(&mut state).unwrap();
 
@@ -2122,39 +2166,35 @@ fn main() {
             _ => None,
         };
 
-        // Idle auto-hide wakes us when the no-keypress window elapses.
-        let idle_timeout = match (state.visible, state.auto_show_enabled, state.last_activity) {
-            (true, true, Some(last)) => {
+        // Toggle-button idle hide wakes us once the post-touch window elapses.
+        let button_hide_timeout = match (state.toggle_visible, state.last_touch_activity) {
+            (true, Some(last)) => {
                 let elapsed = std::time::Instant::now().duration_since(last).as_millis();
-                Some((IDLE_HIDE_MS.saturating_sub(elapsed)) as i32)
+                Some((BUTTON_IDLE_HIDE_MS.saturating_sub(elapsed)) as i32)
             }
             _ => None,
         };
 
         // Block forever unless a timer is pending; otherwise wake at the soonest.
-        let poll_timeout = match (long_press_timeout, idle_timeout) {
+        let poll_timeout = match (long_press_timeout, button_hide_timeout) {
             (Some(a), Some(b)) => a.min(b),
             (Some(a), None) => a,
             (None, Some(b)) => b,
             (None, None) => -1,
         };
 
-        // Poll wayland fd, signal pipe, and optionally tablet mode evdev
-        let (nfds, mut fds) = if let Some(tfd) = tablet_mode_fd {
-            (3, [
-                libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: sig_fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: tfd, events: libc::POLLIN, revents: 0 },
-            ])
-        } else {
-            (2, [
-                libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: sig_fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: -1, events: 0, revents: 0 }, // unused
-            ])
-        };
+        // Poll the wayland fd, the signal pipe, the tablet-mode switch, and every
+        // touchscreen. Fixed fds occupy slots 0..3; touchscreens follow.
+        let mut fds: Vec<libc::pollfd> = vec![
+            libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: sig_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: tablet_mode_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+        ];
+        for &tfd in &touchscreen_fds {
+            fds.push(libc::pollfd { fd: tfd, events: libc::POLLIN, revents: 0 });
+        }
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, poll_timeout) };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -2164,29 +2204,21 @@ fn main() {
             break;
         }
 
-        // Handle signals (manual override via SIGUSR1/SIGUSR2)
+        // Handle signals: SIGUSR1 force-hides the keyboard, SIGUSR2 force-shows it.
         if fds[1].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 16];
             let n = unsafe { libc::read(sig_read.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             let n = if n > 0 { n as usize } else { 0 };
             for &byte in &buf[..n] {
                 match byte as i32 {
-                    libc::SIGUSR1 => {
-                        state.auto_show_enabled = false;
-                        state.hide();
-                        state.hide_toggle_button();
-                    }
-                    libc::SIGUSR2 => {
-                        state.auto_show_enabled = true;
-                        state.show_toggle_button(&qh);
-                        state.pending_show = true;
-                    }
+                    libc::SIGUSR1 => state.hide(),
+                    libc::SIGUSR2 => state.pending_show = true,
                     _ => {}
                 }
             }
         }
 
-        // Handle tablet mode evdev events
+        // Handle tablet mode switch events.
         if fds[2].revents & libc::POLLIN != 0 {
             if let Some(tfd) = tablet_mode_fd {
                 let mut ev = InputEvent { tv_sec: 0, tv_usec: 0, type_: 0, code: 0, value: 0 };
@@ -2199,18 +2231,47 @@ fn main() {
                         break;
                     }
                     if ev.type_ == EV_SW && ev.code == SW_TABLET_MODE {
-                        // Posture only shows/hides the manual toggle button;
-                        // auto-show stays armed and input-method-driven either way.
-                        if ev.value != 0 {
-                            state.show_toggle_button(&qh);
+                        state.tablet_mode = ev.value != 0;
+                        if state.tablet_mode {
+                            // Stay hidden — a touch reveals the button, not the switch.
                             eprintln!("osk: tablet mode on");
                         } else {
+                            // Back to a physical keyboard: tear the OSK affordances down.
                             state.hide_toggle_button();
+                            state.last_touch_activity = None;
+                            state.hide();
                             eprintln!("osk: tablet mode off");
                         }
                     }
                 }
             }
+        }
+
+        // Handle touchscreen events: any input means a finger is on the glass, so
+        // in tablet mode reveal the toggle button and refresh its idle timer.
+        let mut touched = false;
+        for (i, &tfd) in touchscreen_fds.iter().enumerate() {
+            if fds[3 + i].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let mut ev = InputEvent { tv_sec: 0, tv_usec: 0, type_: 0, code: 0, value: 0 };
+            let ev_size = std::mem::size_of::<InputEvent>();
+            loop {
+                let n = unsafe {
+                    libc::read(tfd, &mut ev as *mut InputEvent as *mut libc::c_void, ev_size)
+                };
+                if n != ev_size as isize {
+                    break;
+                }
+                // Key/abs events are real touch activity; SYN/MSC frame padding is not.
+                if ev.type_ == EV_KEY || ev.type_ == EV_ABS {
+                    touched = true;
+                }
+            }
+        }
+        if touched && state.tablet_mode {
+            state.last_touch_activity = Some(std::time::Instant::now());
+            state.show_toggle_button(&qh);
         }
 
         // Handle long-press timeout
@@ -2245,19 +2306,19 @@ fn main() {
             event_queue.dispatch_pending(&mut state).ok();
         }
 
-        // Handle pending show triggered by wayland events (input-method activate)
+        // Handle a show queued by SIGUSR2.
         if state.pending_show {
             state.pending_show = false;
             state.show(&qh);
         }
 
-        // Idle auto-hide: drop the keyboard after a no-keypress window even if a
-        // text field still holds input focus. (Checked after dispatch so a
-        // keypress from this iteration has already refreshed last_activity.)
-        if state.visible && state.auto_show_enabled {
-            if let Some(last) = state.last_activity {
-                if std::time::Instant::now().duration_since(last).as_millis() >= IDLE_HIDE_MS {
-                    state.hide();
+        // Idle-hide the toggle button once touch activity has stopped. The
+        // keyboard is untouched here — it is dismissed only by a button tap.
+        if state.toggle_visible {
+            if let Some(last) = state.last_touch_activity {
+                if std::time::Instant::now().duration_since(last).as_millis() >= BUTTON_IDLE_HIDE_MS {
+                    state.hide_toggle_button();
+                    state.last_touch_activity = None;
                 }
             }
         }
@@ -2268,8 +2329,11 @@ fn main() {
         }
     }
 
-    // Clean up tablet mode fd
+    // Clean up evdev fds
     if let Some(tfd) = tablet_mode_fd {
+        unsafe { libc::close(tfd); }
+    }
+    for &tfd in &touchscreen_fds {
         unsafe { libc::close(tfd); }
     }
 }
