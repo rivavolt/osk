@@ -2114,7 +2114,7 @@ fn main() {
     // The SW_TABLET_MODE switch decides whether the touch-summoned toggle button
     // is in play at all. The button itself stays hidden until the touchscreen is
     // touched; it is never shown merely because we entered tablet mode.
-    let tablet_mode_fd = match open_tablet_mode_device() {
+    let mut tablet_mode_fd = match open_tablet_mode_device() {
         Some((fd, initial_tablet)) => {
             state.tablet_mode = initial_tablet;
             Some(fd)
@@ -2124,7 +2124,7 @@ fn main() {
 
     // Touchscreen fds: any input on them is "the user touched the screen", which
     // is what reveals the toggle button while in tablet mode.
-    let touchscreen_fds = open_touchscreen_devices();
+    let mut touchscreen_fds = open_touchscreen_devices();
 
     event_queue.roundtrip(&mut state).unwrap();
 
@@ -2246,12 +2246,30 @@ fn main() {
                 }
             }
         }
+        // Drop the tablet-mode fd if it has gone stale (device removed by udev
+        // re-enumeration, e.g. after suspend/resume). Without this the dead fd
+        // keeps returning POLLERR|POLLHUP and the loop spins at 100% CPU.
+        if fds[2].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            if let Some(tfd) = tablet_mode_fd.take() {
+                eprintln!("osk: tablet-mode fd went stale, closing");
+                unsafe { libc::close(tfd); }
+            }
+        }
 
         // Handle touchscreen events: any input means a finger is on the glass, so
         // in tablet mode reveal the toggle button and refresh its idle timer.
+        // Track dead fds (POLLERR/POLLHUP/POLLNVAL after a device went away) so we
+        // can prune them — otherwise poll() keeps returning immediately and we
+        // burn CPU in a tight loop.
         let mut touched = false;
+        let mut dead_touchscreen_indices: Vec<usize> = Vec::new();
         for (i, &tfd) in touchscreen_fds.iter().enumerate() {
-            if fds[3 + i].revents & libc::POLLIN == 0 {
+            let revents = fds[3 + i].revents;
+            if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                dead_touchscreen_indices.push(i);
+                continue;
+            }
+            if revents & libc::POLLIN == 0 {
                 continue;
             }
             let mut ev = InputEvent { tv_sec: 0, tv_usec: 0, type_: 0, code: 0, value: 0 };
@@ -2268,6 +2286,12 @@ fn main() {
                     touched = true;
                 }
             }
+        }
+        // Prune stale touchscreens (drop highest index first to keep lower indices valid).
+        for &i in dead_touchscreen_indices.iter().rev() {
+            let tfd = touchscreen_fds.remove(i);
+            eprintln!("osk: touchscreen fd went stale, closing");
+            unsafe { libc::close(tfd); }
         }
         if touched && state.tablet_mode {
             state.last_touch_activity = Some(std::time::Instant::now());
