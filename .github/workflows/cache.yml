@@ -2,6 +2,6 @@ name: cache
 on: { push: { branches: [osk-cpu-fix] }, workflow_dispatch: {} }
 jobs:
   cache:
-    uses: rivavolt/ci/.github/workflows/flake-cache.yml@v1
-    with: { attr: ".#default", runners: '["blacksmith-8vcpu-ubuntu-2204"]' }
+    uses: rivavolt/ci/.github/workflows/avolt-build-cache.yml@v1
+    with: { attr: ".#default" }
     secrets: inherit
